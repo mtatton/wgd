@@ -1,0 +1,333 @@
+WGD replication cluster health diagnostics
+==========================================
+
+The live config is wgd/replication/nodes.ini. Run these diagnostics from NODE010
+or any host that can reach the SQL endpoints.
+
+Connection endpoints from nodes.ini:
+
+  NODE010 publisher/distributor: tcp:192.168.1.2,4001
+  NODE020 subscriber:             tcp:192.168.1.7,4002
+  NODE030 subscriber:             tcp:192.168.1.19,4003
+
+Example sqlcmd login:
+
+  sqlcmd -S tcp:192.168.1.2,4001 -U sa -P "<password>" -C
+
+1. Node identity, database state, and WGD row totals
+---------------------------------------------------
+
+Run once on each node by changing -S to the node endpoint.
+
+USE [master];
+GO
+SELECT
+    @@SERVERNAME AS sql_name,
+    CAST(SERVERPROPERTY('MachineName') AS nvarchar(256)) AS machine_name,
+    CAST(SERVERPROPERTY('Edition') AS nvarchar(256)) AS edition,
+    host_platform,
+    host_distribution,
+    host_release
+FROM sys.dm_os_host_info;
+GO
+
+SELECT
+    name,
+    state_desc,
+    recovery_model_desc,
+    log_reuse_wait_desc
+FROM sys.databases
+WHERE name = N'POVIID';
+GO
+
+USE [POVIID];
+GO
+WITH expected_tables(name) AS (
+    SELECT N'tmp_cameras' UNION ALL
+    SELECT N'tmp_cell_vectors' UNION ALL
+    SELECT N'tmp_cluster_vectors' UNION ALL
+    SELECT N'tmp_descriptions' UNION ALL
+    SELECT N'tmp_graph_cluster_members' UNION ALL
+    SELECT N'tmp_graph_clusters' UNION ALL
+    SELECT N'tmp_lights' UNION ALL
+    SELECT N'tmp_materials' UNION ALL
+    SELECT N'tmp_metadata' UNION ALL
+    SELECT N'tmp_objects' UNION ALL
+    SELECT N'tmp_povs' UNION ALL
+    SELECT N'tmp_scenes' UNION ALL
+    SELECT N'tmp_source_chunks' UNION ALL
+    SELECT N'tmp_source_edges' UNION ALL
+    SELECT N'tmp_source_files' UNION ALL
+    SELECT N'tmp_source_symbols' UNION ALL
+    SELECT N'tmp_spatial_cells' UNION ALL
+    SELECT N'tmp_spatial_edges' UNION ALL
+    SELECT N'tmp_spatial_nodes'
+)
+SELECT
+    @@SERVERNAME AS sql_name,
+    COUNT(DISTINCT CASE WHEN s.name = N'dbo' THEN t.object_id END) AS present_wgd_tables,
+    COUNT(DISTINCT e.name) AS expected_wgd_tables,
+    SUM(CASE WHEN s.name = N'dbo' AND p.index_id IN (0, 1) THEN p.row_count ELSE 0 END) AS total_rows
+FROM expected_tables AS e
+LEFT JOIN sys.tables AS t ON t.name = e.name
+LEFT JOIN sys.schemas AS s ON s.schema_id = t.schema_id
+LEFT JOIN sys.dm_db_partition_stats AS p ON p.object_id = t.object_id;
+GO
+
+WITH expected_tables(name) AS (
+    SELECT N'tmp_cameras' UNION ALL
+    SELECT N'tmp_cell_vectors' UNION ALL
+    SELECT N'tmp_cluster_vectors' UNION ALL
+    SELECT N'tmp_descriptions' UNION ALL
+    SELECT N'tmp_graph_cluster_members' UNION ALL
+    SELECT N'tmp_graph_clusters' UNION ALL
+    SELECT N'tmp_lights' UNION ALL
+    SELECT N'tmp_materials' UNION ALL
+    SELECT N'tmp_metadata' UNION ALL
+    SELECT N'tmp_objects' UNION ALL
+    SELECT N'tmp_povs' UNION ALL
+    SELECT N'tmp_scenes' UNION ALL
+    SELECT N'tmp_source_chunks' UNION ALL
+    SELECT N'tmp_source_edges' UNION ALL
+    SELECT N'tmp_source_files' UNION ALL
+    SELECT N'tmp_source_symbols' UNION ALL
+    SELECT N'tmp_spatial_cells' UNION ALL
+    SELECT N'tmp_spatial_edges' UNION ALL
+    SELECT N'tmp_spatial_nodes'
+)
+SELECT
+    e.name,
+    CASE WHEN t.object_id IS NULL OR s.name <> N'dbo' THEN N'MISSING' ELSE N'present' END AS table_state,
+    SUM(CASE WHEN s.name = N'dbo' AND p.index_id IN (0, 1) THEN p.row_count ELSE 0 END) AS row_count
+FROM expected_tables AS e
+LEFT JOIN sys.tables AS t ON t.name = e.name
+LEFT JOIN sys.schemas AS s ON s.schema_id = t.schema_id
+LEFT JOIN sys.dm_db_partition_stats AS p ON p.object_id = t.object_id
+GROUP BY e.name, t.object_id, s.name
+ORDER BY e.name;
+GO
+
+2. Current replication jobs and commands
+----------------------------------------
+
+Run on NODE010. This intentionally discovers current job suffixes instead of
+assuming NODE010-POVIID-1, because recreate can produce NODE010-POVIID-3 and
+new distribution job suffixes.
+
+USE [msdb];
+GO
+SELECT
+    j.name,
+    s.step_id,
+    s.subsystem,
+    j.enabled,
+    CASE
+        WHEN ja.start_execution_date IS NOT NULL AND ja.stop_execution_date IS NULL THEN 1
+        ELSE 0
+    END AS running,
+    CONVERT(nvarchar(30), ja.start_execution_date, 120) AS start_execution_date,
+    CONVERT(nvarchar(30), ja.stop_execution_date, 120) AS stop_execution_date
+FROM msdb.dbo.sysjobs AS j
+JOIN msdb.dbo.sysjobsteps AS s ON s.job_id = j.job_id
+OUTER APPLY (
+    SELECT TOP (1) start_execution_date, stop_execution_date
+    FROM msdb.dbo.sysjobactivity AS a
+    WHERE a.job_id = j.job_id
+    ORDER BY a.session_id DESC
+) AS ja
+WHERE j.name LIKE N'NODE010-POVIID-%'
+  AND s.step_id = 2
+  AND s.subsystem IN (N'LogReader', N'Distribution')
+ORDER BY CASE WHEN s.subsystem = N'LogReader' THEN 0 ELSE 1 END, j.name;
+GO
+
+SELECT
+    j.name,
+    s.step_id,
+    s.subsystem,
+    CONVERT(nvarchar(max), s.command) AS command
+FROM msdb.dbo.sysjobs AS j
+JOIN msdb.dbo.sysjobsteps AS s ON s.job_id = j.job_id
+WHERE j.name LIKE N'NODE010-POVIID-%'
+  AND s.step_id = 2
+  AND s.subsystem IN (N'LogReader', N'Distribution')
+ORDER BY CASE WHEN s.subsystem = N'LogReader' THEN 0 ELSE 1 END, j.name;
+GO
+
+Healthy generated commands should use:
+
+  LogReader:
+    -Publisher [NODE010] or another name registered in distribution.dbo.MSreplservers
+    -Distributor [tcp:192.168.1.2,4001]
+
+  Distribution:
+    -Publisher [NODE010] or another name registered in distribution.dbo.MSreplservers
+    -Distributor [tcp:192.168.1.2,4001]
+    -Subscriber [NODE020] or [NODE030], matching distribution.dbo.MSreplservers
+
+  -PublisherSecurityMode 0 / -DistributorSecurityMode 0 / -SubscriberSecurityMode 0
+
+If any agent shows -Publisher [tcp:...] or -Subscriber [tcp:...], if Distributor
+is port-qualified without tcp:, or if any job shows SecurityMode 1, patch
+existing jobs with:
+
+  python3 wgd/replication/wgd_replication.py generate-agent-fix-sql > /tmp/wgd_agent_fix.sql
+
+Run /tmp/wgd_agent_fix.sql on NODE010. Recreate replication only if metadata is
+itself broken:
+
+  python3 wgd/replication/wgd_replication.py recreate --password "<password>" --skip-guards
+
+3. Log Reader publisher name resolution
+---------------------------------------
+
+The Log Reader -Publisher value is a logical replication publisher name, so it
+must be the registered Publisher name from distribution metadata rather than
+tcp:192.168.1.2,4001. The SQL Agent host still has to resolve that name to the
+publisher address when the registered name is host-based.
+
+For push Distribution Agents, Subscriber names are logical replication names too.
+If the agent can connect to the Distributor but fails with "could not connect to
+Subscriber 'NODE020'" or 'NODE030', create SQL client aliases on the NODE010 SQL
+Agent host so those names include their non-default ports:
+
+  python3 wgd/replication/wgd_replication.py generate-client-alias-fix > /tmp/wgd_client_alias_fix.ps1
+
+Run /tmp/wgd_client_alias_fix.ps1 as Administrator on NODE010, then restart only
+the Distribution Agent jobs.
+
+Run this from the same host/container where SQL Server Agent runs:
+
+  sqlcmd -S NODE010,4001 -U sa -P "<password>" -C -Q "SELECT @@SERVERNAME AS sql_name"
+
+If that fails but this succeeds, fix host name resolution for NODE010 on the SQL
+Agent host/container, then restart the Log Reader job:
+
+  sqlcmd -S tcp:192.168.1.2,4001 -U sa -P "<password>" -C -Q "SELECT @@SERVERNAME AS sql_name"
+
+4. Replication metadata
+-----------------------
+
+Run on NODE010.
+
+USE [master];
+GO
+SELECT
+    server_id,
+    name,
+    data_source,
+    provider,
+    provider_string,
+    is_linked,
+    is_remote_login_enabled
+FROM sys.servers
+ORDER BY server_id;
+GO
+
+USE [distribution];
+GO
+SELECT srvid, srvname
+FROM dbo.MSreplservers
+ORDER BY srvid;
+GO
+
+SELECT
+    id,
+    name,
+    publisher_id,
+    publisher_db,
+    publication,
+    local_job,
+    publisher_security_mode,
+    publisher_login
+FROM dbo.MSlogreader_agents
+ORDER BY id;
+GO
+
+SELECT
+    id,
+    name,
+    publisher_id,
+    subscriber_id,
+    subscriber_db,
+    local_job,
+    subscriber_security_mode,
+    subscriber_login
+FROM dbo.MSdistribution_agents
+ORDER BY id;
+GO
+
+5. Recent replication history and errors
+----------------------------------------
+
+Run on NODE010.
+
+USE [distribution];
+GO
+SELECT TOP (20)
+    a.name,
+    h.time,
+    h.runstatus,
+    h.duration,
+    h.error_id,
+    h.comments
+FROM dbo.MSlogreader_agents AS a
+JOIN dbo.MSlogreader_history AS h ON h.agent_id = a.id
+ORDER BY h.time DESC;
+GO
+
+SELECT TOP (30)
+    a.name,
+    a.subscriber_name,
+    a.subscriber_db,
+    h.time,
+    h.runstatus,
+    h.duration,
+    h.error_id,
+    h.comments
+FROM dbo.MSdistribution_agents AS a
+JOIN dbo.MSdistribution_history AS h ON h.agent_id = a.id
+ORDER BY h.time DESC;
+GO
+
+SELECT TOP (30)
+    id,
+    time,
+    source_name,
+    error_code,
+    LEFT(error_text, 400) AS error_text,
+    session_id
+FROM dbo.MSrepl_errors
+ORDER BY time DESC, id DESC;
+GO
+
+6. Compare with the Python monitor
+----------------------------------
+
+Read-only CLI snapshot:
+
+python3 - <<'PY'
+from pathlib import Path
+import sys
+sys.path.insert(0, 'wgd/replication')
+from dark_cluster_watch import ClusterService, format_health_finding
+service = ClusterService(Path('wgd/replication/nodes.ini'))
+snapshot = service.refresh()
+for node in snapshot.nodes:
+    print(f'NODE {node.name} connected={node.connected} sql_name={node.sql_name} db={node.database_state} tables={node.wgd_table_count} rows={node.wgd_total_rows} error={node.error}')
+for job in snapshot.jobs:
+    print(f'JOB {job.name} enabled={job.enabled} running={job.running} last_status={job.last_run_status} message={job.last_run_message}')
+for finding in service.health_check():
+    print(format_health_finding(finding) + (f' [{finding.source}]' if finding.source else ''))
+PY
+
+Expected healthy high-level state:
+
+  NODE010, NODE020, NODE030 connected=True
+  POVIID state ONLINE on all nodes
+  present_wgd_tables = 19 on all nodes
+  total_rows equal on all nodes
+  LogReader enabled/running and advancing past Validating publisher
+  Distribution subscriptions active in replication metadata
+  Agent -Publisher/-Subscriber values are logical registered names, Distributor uses tcp:, and all agent SecurityMode values are 0
+  No new Named Pipes, SSPI, login failed, or timeout errors after recreate

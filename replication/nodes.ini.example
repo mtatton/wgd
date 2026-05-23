@@ -1,0 +1,22 @@
+[replication]
+database = POVIID
+schema = dbo
+publisher = NODE010
+publication = WGD_TMP_Publication
+password_file = /tmp/mssqlpass
+
+[NODE010]
+server = 192.168.x.x,4001
+role = publisher
+expected_sql_name = NODE010
+replication_name = NODE010,4001
+
+[NODE020]
+server = 192.168.x.x,4002
+role = subscriber
+expected_sql_name = NODE020
+
+[NODE030]
+server = 192.168.x.x,4003
+role = subscriber
+expected_sql_name = NODE030

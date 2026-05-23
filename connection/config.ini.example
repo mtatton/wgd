@@ -1,0 +1,9 @@
+[connection]
+driver = ODBC Driver 18 for SQL Server
+server = x.x.x.x,1433
+database = POVIID
+username = sa
+password_env = MSSQLTOP
+encrypt = no
+trust_server_certificate = yes
+timeout = 5
