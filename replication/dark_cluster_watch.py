@@ -13,7 +13,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import ttk
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterable, Mapping, Protocol
 
 
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -22,6 +22,9 @@ if str(CURRENT_DIR) not in sys.path:
 
 from wgd_replication import (  # noqa: E402
     DEFAULT_CONFIG,
+    WGD_BASE_TABLES,
+    WGD_ENTITY_TABLES,
+    WGD_FUZZY_TABLES,
     WGD_TABLES,
     ReplConfig,
     all_rows,
@@ -35,8 +38,13 @@ from wgd_replication import (  # noqa: E402
 
 
 APP_NAME = "Dark Cluster Watch"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.3"
 APP_TITLE = f"{APP_NAME} v{APP_VERSION}"
+WGD_TABLE_GROUPS = (
+    ("core", "Core", WGD_BASE_TABLES),
+    ("entities", "Entities", WGD_ENTITY_TABLES),
+    ("fuzzy", "Fuzzy", WGD_FUZZY_TABLES),
+)
 LOG_READER_JOB = "NODE010-POVIID-1"
 NODE020_DISTRIBUTION_JOB = "NODE010-POVIID-WGD_TMP_Publication-NODE020-1"
 NODE030_DISTRIBUTION_JOB = "NODE010-POVIID-WGD_TMP_Publication-NODE030-2"
@@ -50,8 +58,12 @@ DISTRIBUTION_JOB_SUBSCRIBERS = {
 }
 MIN_REFRESH_SECONDS = 5
 MAX_REFRESH_SECONDS = 900
+RESYNC_BATCH_SIZE = 400
+RESYNC_MAX_PARAMS = 1800
 HEALTH_OK = "O.K."
 BAD_JOB_RUN_STATUSES = {0, 2, 3}
+HEALTHY_REPLMONITOR_STATUSES = {1, 2, 3, 4}
+UNHEALTHY_REPLMONITOR_STATUSES = {5, 6}
 UNHEALTHY_JOB_MESSAGE_TOKENS = ("error", "fail", "retry", "refused", "cannot", "unable")
 ROOT_CAUSE_TOKENS = (
     "could not connect",
@@ -77,9 +89,36 @@ AGENT_TOKEN_PLACEHOLDER_MESSAGE = (
     "Replication agent job steps contain SQL Agent token placeholders. Recreate replication with the SQL password "
     "so generated agent commands contain plain bracketed password values."
 )
+WGD_RESYNC_KEYS = {
+    "tmp_metadata": ("key",),
+    "tmp_scenes": ("scene_key",),
+    "tmp_objects": ("object_key",),
+    "tmp_povs": ("pov_key",),
+    "tmp_materials": ("material_key",),
+    "tmp_cameras": ("camera_key",),
+    "tmp_lights": ("light_key",),
+    "tmp_descriptions": ("description_key",),
+    "tmp_spatial_nodes": ("node_key",),
+    "tmp_spatial_edges": ("from_node_key", "to_node_key", "edge_type"),
+    "tmp_spatial_cells": ("cell_key",),
+    "tmp_cell_vectors": ("cell_key", "modality"),
+    "tmp_graph_clusters": ("cluster_key",),
+    "tmp_graph_cluster_members": ("cluster_key", "node_key", "member_role"),
+    "tmp_cluster_vectors": ("cluster_key", "modality"),
+    "tmp_wgd_entities": ("entity_key",),
+    "tmp_wgd_entity_links": ("link_key",),
+    "tmp_fuzzy_groups": ("group_key",),
+    "tmp_fuzzy_memberships": ("group_key", "source_entity_key"),
+    "tmp_fuzzy_relations": ("relation_key",),
+    "tmp_fuzzy_relation_samples": ("relation_key", "sample_rank"),
+    "tmp_source_files": ("file_key",),
+    "tmp_source_symbols": ("symbol_key",),
+    "tmp_source_chunks": ("chunk_key",),
+    "tmp_source_edges": ("from_key", "to_key", "edge_type"),
+}
 LOG_TOKEN_RE = re.compile(
     r"(?<![\w.])"
-    r"(O\.K\.|ok|warning|retry|stopped|error|failed|refused|cannot|unable|health|check|restart|refresh|snapshot|started|done|start|stop)"
+    r"(O\.K\.|ok|warning|retry|stopped|error|failed|refused|cannot|unable|health|check|restart|refresh|resync|sync|snapshot|started|done|start|stop)"
     r"(?![\w.])",
     re.IGNORECASE,
 )
@@ -110,6 +149,13 @@ LOG_COLORS = {
 
 
 @dataclass(frozen=True)
+class TableGroupSummary:
+    table_count: int = 0
+    expected_table_count: int = 0
+    total_rows: int = 0
+
+
+@dataclass(frozen=True)
 class NodeStatus:
     name: str
     server: str
@@ -121,6 +167,10 @@ class NodeStatus:
     recovery_model: str = ""
     wgd_table_count: int = 0
     wgd_total_rows: int = 0
+    wgd_core: TableGroupSummary = field(default_factory=lambda: TableGroupSummary(expected_table_count=len(WGD_BASE_TABLES)))
+    wgd_entities: TableGroupSummary = field(default_factory=lambda: TableGroupSummary(expected_table_count=len(WGD_ENTITY_TABLES)))
+    wgd_fuzzy: TableGroupSummary = field(default_factory=lambda: TableGroupSummary(expected_table_count=len(WGD_FUZZY_TABLES)))
+    wgd_group_breakdown_available: bool = False
     error: str = ""
 
 
@@ -153,6 +203,29 @@ class JobActionResult:
     command: str
     ok: bool
     error: str = ""
+
+
+@dataclass(frozen=True)
+class TableResyncResult:
+    node: str
+    table_name: str
+    missing: int = 0
+    hash_mismatch: int = 0
+    extra: int = 0
+    inserted: int = 0
+    updated: int = 0
+    deleted: int = 0
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class ClusterResyncResult:
+    before_rows: dict[str, int]
+    after_rows: dict[str, int]
+    drift_tables: tuple[str, ...]
+    table_results: list[TableResyncResult] = field(default_factory=list)
+    stopped_jobs: tuple[str, ...] = ()
+    errors: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -190,6 +263,9 @@ class ClusterAdapter(Protocol):
     def run_job_command(self, config: ReplConfig, command: str, job_names: tuple[str, ...]) -> list[JobActionResult]:
         ...
 
+    def resync_subscribers(self, config: ReplConfig) -> ClusterResyncResult:
+        ...
+
 
 class SqlClusterAdapter:
     """SQL Server-backed cluster adapter."""
@@ -206,6 +282,7 @@ class SqlClusterAdapter:
                 props = server_properties(connection)
                 db = database_properties(connection, config.database)["database"]
                 counts = table_counts(connection, config)
+                group_summaries = wgd_group_summaries(counts)
                 statuses.append(
                     NodeStatus(
                         name=node.name,
@@ -218,6 +295,10 @@ class SqlClusterAdapter:
                         recovery_model=str(db.get("recovery_model_desc") or ""),
                         wgd_table_count=len(counts),
                         wgd_total_rows=sum(counts.values()),
+                        wgd_core=group_summaries["core"],
+                        wgd_entities=group_summaries["entities"],
+                        wgd_fuzzy=group_summaries["fuzzy"],
+                        wgd_group_breakdown_available=True,
                     )
                 )
             except Exception as exc:
@@ -329,6 +410,9 @@ class SqlClusterAdapter:
         finally:
             connection.close()
 
+    def resync_subscribers(self, config: ReplConfig) -> ClusterResyncResult:
+        return resync_subscribers_from_publisher(config)
+
 
 def port_qualified_distributor(config: ReplConfig) -> str:
     return config.nodes[config.publisher].replication_name
@@ -336,6 +420,52 @@ def port_qualified_distributor(config: ReplConfig) -> str:
 
 def publisher_sql_name(config: ReplConfig) -> str:
     return config.nodes[config.publisher].expected_sql_name
+
+
+def table_group_summary(counts: dict[str, int], tables: tuple[str, ...]) -> TableGroupSummary:
+    return TableGroupSummary(
+        table_count=sum(1 for table in tables if table in counts),
+        expected_table_count=len(tables),
+        total_rows=sum(int(counts.get(table, 0)) for table in tables),
+    )
+
+
+def wgd_group_summaries(counts: dict[str, int]) -> dict[str, TableGroupSummary]:
+    return {key: table_group_summary(counts, tables) for key, _label, tables in WGD_TABLE_GROUPS}
+
+
+def table_group_display(summary: TableGroupSummary) -> str:
+    return f"{summary.table_count}/{summary.expected_table_count} ({summary.total_rows:,} rows)"
+
+
+def table_group_count_display(summary: TableGroupSummary) -> str:
+    return f"{summary.table_count}/{summary.expected_table_count}"
+
+
+def wgd_entities_display(status: NodeStatus) -> str:
+    if not status.wgd_group_breakdown_available:
+        return ""
+    return (
+        f"Core {table_group_count_display(status.wgd_core)} | "
+        f"Entities {table_group_count_display(status.wgd_entities)} | "
+        f"Fuzzy {table_group_count_display(status.wgd_fuzzy)}"
+    )
+
+
+def wgd_group_problem_detail(status: NodeStatus) -> str:
+    if not status.wgd_group_breakdown_available:
+        return ""
+    groups = (
+        ("core", status.wgd_core),
+        ("entities", status.wgd_entities),
+        ("fuzzy", status.wgd_fuzzy),
+    )
+    missing = [
+        f"{label} {summary.table_count}/{summary.expected_table_count}"
+        for label, summary in groups
+        if summary.table_count < summary.expected_table_count
+    ]
+    return ", ".join(missing)
 
 
 class ClusterService:
@@ -363,6 +493,9 @@ class ClusterService:
 
     def stop_replication(self) -> list[JobActionResult]:
         return self.adapter.run_job_command(self.config, "stop", STOP_JOB_ORDER)
+
+    def resync_subscribers(self) -> ClusterResyncResult:
+        return self.adapter.resync_subscribers(self.config)
 
     def health_check(self) -> list[HealthFinding]:
         return self.adapter.collect_health_findings(self.config)
@@ -425,8 +558,10 @@ def node_connectivity_problem(status: NodeStatus) -> str:
         return f"{status.name} offline"
     if status.database_state.upper() != "ONLINE":
         return f"{status.name} POVIID {status.database_state or 'unknown'}"
-    if status.wgd_table_count < len(WGD_TABLES):
-        return f"{status.name} WGD tables {status.wgd_table_count}/{len(WGD_TABLES)}"
+    group_detail = wgd_group_problem_detail(status)
+    if status.wgd_table_count < len(WGD_TABLES) or group_detail:
+        suffix = f" ({group_detail})" if group_detail else ""
+        return f"{status.name} WGD tables {status.wgd_table_count}/{len(WGD_TABLES)}{suffix}"
     return ""
 
 
@@ -439,7 +574,7 @@ def node_status_indicator(status: NodeStatus) -> HealthIndicator:
     return HealthIndicator(HEALTH_OK, COLORS["good"])
 
 
-def sync_indicator(jobs: list[JobStatus], errors: list[str] | None = None) -> HealthIndicator:
+def sync_indicator(jobs: list[JobStatus], errors: list[str] | None = None, nodes: list[NodeStatus] | None = None) -> HealthIndicator:
     job_errors = [error for error in errors or [] if str(error).lower().startswith("replication jobs:")]
     if job_errors:
         return HealthIndicator("Error", COLORS["bad"], job_errors[0])
@@ -456,7 +591,38 @@ def sync_indicator(jobs: list[JobStatus], errors: list[str] | None = None) -> He
             problems.append(f"{job_name} {problem}")
     if problems:
         return HealthIndicator("Warning", COLORS["warn"], "; ".join(problems))
+    consistency_problems = row_count_consistency_problems(nodes or [])
+    if consistency_problems:
+        return HealthIndicator("Warning", COLORS["warn"], "; ".join(consistency_problems))
     return HealthIndicator(HEALTH_OK, COLORS["good"])
+
+
+def row_count_consistency_problems(nodes: list[NodeStatus]) -> list[str]:
+    by_name = {node.name: node for node in nodes}
+    publisher = by_name.get("NODE010")
+    if not publisher or not node_ready_for_row_compare(publisher):
+        return []
+    problems = []
+    for node_name in ("NODE020", "NODE030"):
+        subscriber = by_name.get(node_name)
+        if not subscriber or not node_ready_for_row_compare(subscriber):
+            continue
+        delta = publisher.wgd_total_rows - subscriber.wgd_total_rows
+        if delta:
+            problems.append(
+                f"{subscriber.name} rows {subscriber.wgd_total_rows:,} vs "
+                f"NODE010 {publisher.wgd_total_rows:,} ({delta:+,})"
+            )
+    return problems
+
+
+def node_ready_for_row_compare(status: NodeStatus) -> bool:
+    return (
+        status.connected
+        and status.database_state.upper() == "ONLINE"
+        and status.wgd_table_count == len(WGD_TABLES)
+        and status.wgd_total_rows > 0
+    )
 
 
 def is_job_healthy(job: JobStatus) -> bool:
@@ -569,6 +735,8 @@ def build_cluster_health_findings(
             add("Error" if not node.connected else "Warning", problem, node_name)
         else:
             add(HEALTH_OK, f"{node_name}: node healthy", node_name)
+    for problem in row_count_consistency_problems(nodes):
+        add("Warning", problem, "replication consistency")
 
     by_job = {job.name: job for job in jobs}
     root_cause_jobs = set()
@@ -1062,6 +1230,7 @@ def read_current_replication_jobs(connection: Any, config: ReplConfig) -> tuple[
         LEFT JOIN distribution.dbo.MSdistribution_agents AS d
                ON d.name = j.name AND s.subsystem = N'Distribution'
         WHERE j.name LIKE ?
+          AND j.enabled = 1
           AND s.step_id = 2
           AND s.subsystem IN (N'LogReader', N'Distribution')
         ORDER BY CASE WHEN s.subsystem = N'LogReader' THEN 0 ELSE 1 END, j.name
@@ -1153,6 +1322,7 @@ def read_distribution_replication_statuses(connection: Any, jobs: tuple[Replicat
         return {}
     agent_ids = tuple(int(job.agent_id) for job in distribution_jobs if job.agent_id is not None)
     placeholders = ", ".join("?" for _ in agent_ids)
+    monitor_statuses = read_distribution_monitor_statuses(connection, distribution_jobs)
     try:
         subscription_rows = all_rows(
             connection,
@@ -1185,7 +1355,7 @@ def read_distribution_replication_statuses(connection: Any, jobs: tuple[Replicat
             *agent_ids,
         )
     except Exception:
-        return {}
+        return monitor_statuses
 
     subscriptions_by_agent = {int(row["agent_id"]): row for row in subscription_rows if row.get("agent_id") is not None}
     history_by_agent = {int(row["agent_id"]): row for row in history_rows if row.get("agent_id") is not None}
@@ -1214,7 +1384,123 @@ def read_distribution_replication_statuses(connection: Any, jobs: tuple[Replicat
         else:
             message = "No distribution subscription rows found."
         statuses[job.name] = {"running": running, "message": message}
+    statuses.update(monitor_statuses)
     return statuses
+
+
+def read_distribution_monitor_statuses(connection: Any, jobs: list[ReplicationJobInfo]) -> dict[str, dict[str, Any]]:
+    agent_ids = tuple(int(job.agent_id) for job in jobs if job.agent_id is not None)
+    if not agent_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in agent_ids)
+    try:
+        metadata_rows = all_rows(
+            connection,
+            f"""
+            SELECT DISTINCT a.id AS agent_id, a.name AS agent_name,
+                   publisher.srvname AS publisher,
+                   p.publisher_db,
+                   p.publication
+            FROM distribution.dbo.MSdistribution_agents AS a
+            JOIN distribution.dbo.MSsubscriptions AS s ON s.agent_id = a.id
+            JOIN distribution.dbo.MSpublications AS p
+                 ON p.publisher_id = s.publisher_id
+                AND p.publisher_db = s.publisher_db
+                AND p.publication_id = s.publication_id
+            JOIN distribution.dbo.MSreplservers AS publisher ON publisher.srvid = p.publisher_id
+            WHERE a.id IN ({placeholders})
+            """,
+            *agent_ids,
+        )
+    except Exception:
+        return {}
+
+    expected_names = {job.name for job in jobs}
+    publication_keys = sorted(
+        {
+            (
+                str(row.get("publisher") or ""),
+                str(row.get("publisher_db") or ""),
+                str(row.get("publication") or ""),
+            )
+            for row in metadata_rows
+            if row.get("publisher") and row.get("publisher_db") and row.get("publication")
+        }
+    )
+    statuses: dict[str, dict[str, Any]] = {}
+    for publisher, publisher_db, publication in publication_keys:
+        for row in read_replmonitor_subscription_rows(
+            connection,
+            publisher=publisher,
+            publisher_db=publisher_db,
+            publication=publication,
+        ):
+            job_name = str(row.get("distribution_agentname") or "")
+            if job_name not in expected_names:
+                continue
+            statuses[job_name] = replmonitor_subscription_status(row)
+    return statuses
+
+
+def read_replmonitor_subscription_rows(
+    connection: Any,
+    *,
+    publisher: str,
+    publisher_db: str,
+    publication: str,
+) -> list[dict[str, Any]]:
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            """
+            EXEC distribution.dbo.sp_replmonitorhelpsubscription
+                 @publisher = ?,
+                 @publisher_db = ?,
+                 @publication = ?,
+                 @publication_type = 0,
+                 @mode = 0
+            """,
+            publisher,
+            publisher_db,
+            publication,
+        )
+        if cursor.description is None:
+            return []
+        columns = [column[0] for column in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    except Exception:
+        return []
+    finally:
+        cursor.close()
+
+
+def replmonitor_subscription_status(row: Mapping[str, Any]) -> dict[str, Any]:
+    status = optional_int(row.get("status"))
+    warning = int(row.get("warning") or 0)
+    running = status in HEALTHY_REPLMONITOR_STATUSES and warning == 0
+    return {"running": running, "message": replmonitor_subscription_message(row, running=running)}
+
+
+def replmonitor_subscription_message(row: Mapping[str, Any], *, running: bool) -> str:
+    status = optional_int(row.get("status"))
+    latency = row.get("latency")
+    last_sync = row.get("last_distsync")
+    if running:
+        parts = [f"Replication monitor status {status}"]
+        if latency is not None:
+            parts.append(f"latency {latency} sec")
+        if last_sync:
+            parts.append(f"last sync {last_sync}")
+        return "; ".join(parts) + "."
+    warning = int(row.get("warning") or 0)
+    return f"Replication monitor status {status}, warning {warning}."
+
+
+def optional_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def read_latest_job_history(connection: Any, job_names: tuple[str, ...]) -> dict[str, dict[str, Any]]:
@@ -1411,6 +1697,339 @@ def execute_job_command(connection: Any, command: str, job_names: tuple[str, ...
     return results
 
 
+def resync_subscribers_from_publisher(config: ReplConfig) -> ClusterResyncResult:
+    before_counts = cluster_table_counts(config)
+    before_rows = cluster_row_totals(before_counts)
+    drift_tables = tuple(tables_with_count_drift(before_counts))
+    table_results: list[TableResyncResult] = []
+    errors: list[str] = []
+    stopped_jobs: tuple[str, ...] = ()
+
+    if not drift_tables:
+        return ClusterResyncResult(before_rows=before_rows, after_rows=before_rows, drift_tables=())
+
+    publisher_connection: Any | None = None
+    try:
+        stopped_jobs = stop_distribution_jobs_for_resync(config)
+        publisher = config.nodes[config.publisher]
+        publisher_connection = connect(publisher, config, database=config.database, timeout=15)
+        for node in config.nodes.values():
+            if node.role != "subscriber":
+                continue
+            table_results.extend(resync_subscriber_tables(config, publisher_connection, node.name, drift_tables))
+    except Exception as exc:
+        errors.append(str(exc))
+    finally:
+        if publisher_connection is not None:
+            publisher_connection.close()
+        if stopped_jobs:
+            for result in start_distribution_jobs_after_resync(config, stopped_jobs):
+                if not result.ok:
+                    errors.append(f"{result.job_name}: {result.error}")
+
+    after_counts = cluster_table_counts(config)
+    return ClusterResyncResult(
+        before_rows=before_rows,
+        after_rows=cluster_row_totals(after_counts),
+        drift_tables=tuple(tables_with_count_drift(after_counts)),
+        table_results=table_results,
+        stopped_jobs=stopped_jobs,
+        errors=errors,
+    )
+
+
+def cluster_table_counts(config: ReplConfig) -> dict[str, dict[str, int]]:
+    counts: dict[str, dict[str, int]] = {}
+    for name, node in config.nodes.items():
+        connection = connect(node, config, timeout=10)
+        try:
+            counts[name] = table_counts(connection, config)
+        finally:
+            connection.close()
+    return counts
+
+
+def cluster_row_totals(counts: Mapping[str, Mapping[str, int]]) -> dict[str, int]:
+    return {name: sum(int(value) for value in table_counts.values()) for name, table_counts in counts.items()}
+
+
+def tables_with_count_drift(counts: Mapping[str, Mapping[str, int]]) -> list[str]:
+    publisher_counts = counts.get("NODE010", {})
+    drift = []
+    for table in WGD_TABLES:
+        publisher_count = int(publisher_counts.get(table, 0))
+        if any(int(node_counts.get(table, 0)) != publisher_count for name, node_counts in counts.items() if name != "NODE010"):
+            drift.append(table)
+    return drift
+
+
+def stop_distribution_jobs_for_resync(config: ReplConfig) -> tuple[str, ...]:
+    publisher = config.nodes[config.publisher]
+    connection = connect(publisher, config, database="msdb", timeout=10)
+    try:
+        jobs = tuple(job for job in read_current_replication_jobs(connection, config) if job.subsystem.lower() == "distribution")
+        if not jobs:
+            return ()
+        names = tuple(job.name for job in jobs)
+        results = execute_job_command(connection, "stop", names)
+        failed = [f"{result.job_name}: {result.error}" for result in results if not result.ok]
+        if failed:
+            raise RuntimeError("could not stop distribution jobs: " + "; ".join(failed))
+        wait_for_jobs_to_stop(connection, jobs, timeout_seconds=60)
+        return names
+    finally:
+        connection.close()
+
+
+def start_distribution_jobs_after_resync(config: ReplConfig, job_names: tuple[str, ...]) -> list[JobActionResult]:
+    publisher = config.nodes[config.publisher]
+    connection = connect(publisher, config, database="msdb", timeout=10)
+    try:
+        return execute_job_command(connection, "start", job_names)
+    finally:
+        connection.close()
+
+
+def wait_for_jobs_to_stop(connection: Any, jobs: tuple[ReplicationJobInfo, ...], *, timeout_seconds: float) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    names = {job.name for job in jobs}
+    while time.monotonic() < deadline:
+        statuses = {status.name: status for status in read_job_statuses(connection, jobs)}
+        if all(not statuses.get(name) or not statuses[name].running for name in names):
+            return
+        time.sleep(2)
+
+
+def resync_subscriber_tables(
+    config: ReplConfig,
+    publisher_connection: Any,
+    subscriber_name: str,
+    drift_tables: tuple[str, ...],
+) -> list[TableResyncResult]:
+    subscriber = config.nodes[subscriber_name]
+    subscriber_connection = connect(subscriber, config, database=config.database, timeout=15)
+    subscriber_connection.autocommit = False
+    results: list[TableResyncResult] = []
+    try:
+        for table in drift_tables:
+            try:
+                result = resync_subscriber_table(config, publisher_connection, subscriber_connection, subscriber_name, table)
+            except Exception as exc:
+                subscriber_connection.rollback()
+                result = TableResyncResult(node=subscriber_name, table_name=table, error=str(exc))
+            results.append(result)
+    finally:
+        subscriber_connection.close()
+    return results
+
+
+def resync_subscriber_table(
+    config: ReplConfig,
+    publisher_connection: Any,
+    subscriber_connection: Any,
+    subscriber_name: str,
+    table: str,
+) -> TableResyncResult:
+    keys = WGD_RESYNC_KEYS[table]
+    columns, identity_columns, has_hash = resync_column_metadata(publisher_connection, config.schema, table)
+    publisher_hashes = read_resync_key_hashes(publisher_connection, config.schema, table, keys, has_hash)
+    subscriber_hashes = read_resync_key_hashes(subscriber_connection, config.schema, table, keys, has_hash)
+    missing = [key for key in publisher_hashes if key not in subscriber_hashes]
+    extra = [key for key in subscriber_hashes if key not in publisher_hashes]
+    hash_mismatch = [
+        key
+        for key, publisher_hash in publisher_hashes.items()
+        if has_hash and key in subscriber_hashes and (publisher_hash or "") != (subscriber_hashes[key] or "")
+    ]
+
+    inserted = updated = deleted = 0
+    per_fetch = max(1, min(RESYNC_BATCH_SIZE, RESYNC_MAX_PARAMS // max(1, len(keys))))
+    for batch in sequence_chunks(missing, per_fetch):
+        rows = fetch_resync_rows(publisher_connection, config.schema, table, columns, keys, batch)
+        inserted += insert_resync_rows(subscriber_connection, config.schema, table, columns, identity_columns, rows)
+    for batch in sequence_chunks(hash_mismatch, per_fetch):
+        rows = fetch_resync_rows(publisher_connection, config.schema, table, columns, keys, batch)
+        updated += update_resync_rows(subscriber_connection, config.schema, table, columns, identity_columns, keys, rows)
+    if extra:
+        deleted += delete_resync_keys(subscriber_connection, config.schema, table, keys, extra)
+    subscriber_connection.commit()
+    return TableResyncResult(
+        node=subscriber_name,
+        table_name=table,
+        missing=len(missing),
+        hash_mismatch=len(hash_mismatch),
+        extra=len(extra),
+        inserted=inserted,
+        updated=updated,
+        deleted=deleted,
+    )
+
+
+def resync_column_metadata(connection: Any, schema: str, table: str) -> tuple[list[str], set[str], bool]:
+    rows = all_rows(
+        connection,
+        """
+        SELECT c.name, c.is_identity, c.is_computed
+        FROM sys.columns AS c
+        WHERE c.object_id = OBJECT_ID(?)
+        ORDER BY c.column_id
+        """,
+        f"{schema}.{table}",
+    )
+    columns = [str(row["name"]) for row in rows if not bool(row.get("is_computed"))]
+    identity_columns = {str(row["name"]) for row in rows if bool(row.get("is_identity"))}
+    return columns, identity_columns, "sync_hash" in columns
+
+
+def read_resync_key_hashes(
+    connection: Any,
+    schema: str,
+    table: str,
+    keys: tuple[str, ...],
+    has_hash: bool,
+) -> dict[tuple[Any, ...], Any]:
+    select_columns = list(keys)
+    if has_hash:
+        select_columns.append("sync_hash")
+    cursor = connection.cursor()
+    try:
+        cursor.execute(f"SELECT {', '.join(sql_quote(column) for column in select_columns)} FROM {qualified_sql_table(schema, table)}")
+        key_hashes: dict[tuple[Any, ...], Any] = {}
+        for row in cursor.fetchall():
+            key = tuple(row[index] for index in range(len(keys)))
+            key_hashes[key] = row[len(keys)] if has_hash else None
+        return key_hashes
+    finally:
+        cursor.close()
+
+
+def fetch_resync_rows(
+    connection: Any,
+    schema: str,
+    table: str,
+    columns: list[str],
+    keys: tuple[str, ...],
+    key_batch: list[tuple[Any, ...]],
+) -> list[tuple[Any, ...]]:
+    if not key_batch:
+        return []
+    sql = (
+        f"SELECT {', '.join(sql_quote(column) for column in columns)} "
+        f"FROM {qualified_sql_table(schema, table)} WHERE {key_where_sql(keys, len(key_batch))}"
+    )
+    cursor = connection.cursor()
+    try:
+        cursor.execute(sql, *flatten_key_values(key_batch))
+        return [tuple(row) for row in cursor.fetchall()]
+    finally:
+        cursor.close()
+
+
+def insert_resync_rows(
+    connection: Any,
+    schema: str,
+    table: str,
+    columns: list[str],
+    identity_columns: set[str],
+    rows: list[tuple[Any, ...]],
+) -> int:
+    if not rows:
+        return 0
+    cursor = connection.cursor()
+    placeholders = ", ".join("?" for _ in columns)
+    sql = (
+        f"INSERT INTO {qualified_sql_table(schema, table)} ({', '.join(sql_quote(column) for column in columns)}) "
+        f"VALUES ({placeholders})"
+    )
+    try:
+        if identity_columns:
+            cursor.execute(f"SET IDENTITY_INSERT {qualified_sql_table(schema, table)} ON")
+        for batch in sequence_chunks(rows, RESYNC_BATCH_SIZE):
+            cursor.executemany(sql, batch)
+    finally:
+        if identity_columns:
+            cursor.execute(f"SET IDENTITY_INSERT {qualified_sql_table(schema, table)} OFF")
+        cursor.close()
+    return len(rows)
+
+
+def update_resync_rows(
+    connection: Any,
+    schema: str,
+    table: str,
+    columns: list[str],
+    identity_columns: set[str],
+    keys: tuple[str, ...],
+    rows: list[tuple[Any, ...]],
+) -> int:
+    if not rows:
+        return 0
+    key_set = set(keys)
+    update_columns = [column for column in columns if column not in key_set and column not in identity_columns]
+    if not update_columns:
+        return 0
+    column_indexes = {column: index for index, column in enumerate(columns)}
+    assignments = ", ".join(f"{sql_quote(column)} = ?" for column in update_columns)
+    where = " AND ".join(f"{sql_quote(key)} = ?" for key in keys)
+    sql = f"UPDATE {qualified_sql_table(schema, table)} SET {assignments} WHERE {where}"
+    params = [
+        tuple(row[column_indexes[column]] for column in update_columns)
+        + tuple(row[column_indexes[key]] for key in keys)
+        for row in rows
+    ]
+    cursor = connection.cursor()
+    try:
+        for batch in sequence_chunks(params, RESYNC_BATCH_SIZE):
+            cursor.executemany(sql, batch)
+    finally:
+        cursor.close()
+    return len(rows)
+
+
+def delete_resync_keys(
+    connection: Any,
+    schema: str,
+    table: str,
+    keys: tuple[str, ...],
+    key_batch: list[tuple[Any, ...]],
+) -> int:
+    cursor = connection.cursor()
+    try:
+        per_batch = max(1, min(RESYNC_BATCH_SIZE, RESYNC_MAX_PARAMS // max(1, len(keys))))
+        deleted = 0
+        for batch in sequence_chunks(key_batch, per_batch):
+            cursor.execute(
+                f"DELETE FROM {qualified_sql_table(schema, table)} WHERE {key_where_sql(keys, len(batch))}",
+                *flatten_key_values(batch),
+            )
+            deleted += len(batch)
+        return deleted
+    finally:
+        cursor.close()
+
+
+def sql_quote(identifier: str) -> str:
+    return "[" + identifier.replace("]", "]]") + "]"
+
+
+def qualified_sql_table(schema: str, table: str) -> str:
+    return f"{sql_quote(schema)}.{sql_quote(table)}"
+
+
+def key_where_sql(keys: tuple[str, ...], count: int) -> str:
+    single = "(" + " AND ".join(f"{sql_quote(key)} = ?" for key in keys) + ")"
+    return " OR ".join(single for _ in range(count))
+
+
+def flatten_key_values(keys: list[tuple[Any, ...]]) -> list[Any]:
+    return [value for key in keys for value in key]
+
+
+def sequence_chunks(sequence: list[Any], size: int) -> Iterable[list[Any]]:
+    for index in range(0, len(sequence), size):
+        yield sequence[index : index + size]
+
+
 class DarkClusterWatch(tk.Tk):
     def __init__(self, service: ClusterService, initial_interval: int = 30) -> None:
         super().__init__()
@@ -1468,10 +2087,11 @@ class DarkClusterWatch(tk.Tk):
         controls.pack(fill="x", pady=(14, 12))
         self.refresh_button = ttk.Button(controls, text="Refresh now", style="Dark.TButton", command=self.refresh_now)
         self.health_button = ttk.Button(controls, text="Health check", style="Dark.TButton", command=self.health_check)
+        self.sync_button = ttk.Button(controls, text="Sync rows", style="Dark.TButton", command=self.sync_rows)
         self.start_button = ttk.Button(controls, text="Start replication", style="Dark.TButton", command=self.start_replication)
         self.stop_button = ttk.Button(controls, text="Stop replication", style="Dark.TButton", command=self.stop_replication)
         self.restart_button = ttk.Button(controls, text="Restart replication", style="Dark.TButton", command=self.restart_replication)
-        for button in (self.refresh_button, self.health_button, self.start_button, self.stop_button, self.restart_button):
+        for button in (self.refresh_button, self.health_button, self.sync_button, self.start_button, self.stop_button, self.restart_button):
             button.pack(side="left", padx=(0, 8))
 
         ttk.Label(controls, text="Refresh interval", style="Muted.TLabel").pack(side="left", padx=(18, 6))
@@ -1553,10 +2173,10 @@ class DarkClusterWatch(tk.Tk):
         panel.pack(side="left", fill="both", expand=True, padx=(0, 10))
         ttk.Label(panel, text=node_name, style="PanelTitle.TLabel").pack(anchor="w")
         fields: dict[str, tk.Label] = {}
-        for label in ("Status", "Server", "SQL name", "Edition", "POVIID", "WGD tables", "Rows"):
+        for label in ("Status", "Server", "SQL name", "Edition", "POVIID", "WGD tables", "Rows", "WGD Entities"):
             row = ttk.Frame(panel, style="Panel.TFrame")
             row.pack(fill="x", pady=(6, 0))
-            ttk.Label(row, text=label, style="PanelMuted.TLabel", width=10).pack(side="left")
+            ttk.Label(row, text=label, style="PanelMuted.TLabel", width=12).pack(side="left")
             value = tk.Label(row, text="...", bg=COLORS["panel"], fg=COLORS["text"], anchor="w")
             value.pack(side="left", fill="x", expand=True)
             fields[label] = value
@@ -1571,6 +2191,9 @@ class DarkClusterWatch(tk.Tk):
 
     def health_check(self) -> None:
         self._run_worker("Health check", self.service.health_check, self._apply_health_findings)
+
+    def sync_rows(self) -> None:
+        self._run_worker("Sync rows", self.service.resync_subscribers, self._apply_resync_result)
 
     def start_replication(self) -> None:
         self._run_worker("Start replication", self.service.start_replication, self._apply_action_results)
@@ -1612,7 +2235,7 @@ class DarkClusterWatch(tk.Tk):
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
-        for button in (self.refresh_button, self.health_button, self.start_button, self.stop_button, self.restart_button):
+        for button in (self.refresh_button, self.health_button, self.sync_button, self.start_button, self.stop_button, self.restart_button):
             button.configure(state=state)
 
     def _apply_snapshot(self, snapshot: ClusterSnapshot) -> None:
@@ -1628,7 +2251,7 @@ class DarkClusterWatch(tk.Tk):
 
     def _update_health(self, snapshot: ClusterSnapshot) -> None:
         connectivity = connectivity_indicator(snapshot.nodes, snapshot.errors)
-        sync = sync_indicator(snapshot.jobs, snapshot.errors)
+        sync = sync_indicator(snapshot.jobs, snapshot.errors, snapshot.nodes)
         self.connectivity_label.configure(text=f"Connectivity: {connectivity.label}", foreground=connectivity.color)
         self.sync_label.configure(text=f"Sync: {sync.label}", foreground=sync.color)
 
@@ -1644,12 +2267,14 @@ class DarkClusterWatch(tk.Tk):
             fields["POVIID"].configure(text=f"{status.database_state} / {status.recovery_model}")
             fields["WGD tables"].configure(text=f"{status.wgd_table_count}/{len(WGD_TABLES)}")
             fields["Rows"].configure(text=f"{status.wgd_total_rows:,}")
+            fields["WGD Entities"].configure(text=wgd_entities_display(status))
         else:
             fields["SQL name"].configure(text=status.error[:90])
             fields["Edition"].configure(text="")
             fields["POVIID"].configure(text="")
             fields["WGD tables"].configure(text="")
             fields["Rows"].configure(text="")
+            fields["WGD Entities"].configure(text="")
         fields["Server"].configure(text=status.server)
 
     def _update_jobs(self, jobs: list[JobStatus]) -> None:
@@ -1679,6 +2304,39 @@ class DarkClusterWatch(tk.Tk):
                 self._log(f"{result.command} {result.job_name}: ok")
             else:
                 self._log(f"{result.command} {result.job_name}: {result.error}")
+        self.after(100, self.refresh_now)
+
+    def _apply_resync_result(self, result: ClusterResyncResult) -> None:
+        if result.stopped_jobs:
+            self._log(f"Sync paused distribution jobs: {', '.join(result.stopped_jobs)}")
+        if not result.table_results and not result.errors:
+            self._log("Sync found no row-count drift.")
+        for table_result in result.table_results:
+            if table_result.error:
+                self._log(f"Sync {table_result.node} {table_result.table_name}: {table_result.error}")
+                continue
+            if (
+                table_result.inserted
+                or table_result.updated
+                or table_result.deleted
+                or table_result.missing
+                or table_result.hash_mismatch
+                or table_result.extra
+            ):
+                self._log(
+                    f"Sync {table_result.node} {table_result.table_name}: "
+                    f"inserted {table_result.inserted}, updated {table_result.updated}, deleted {table_result.deleted}"
+                )
+        for error in result.errors:
+            self._log(f"Sync error: {error}")
+        before = ", ".join(f"{node} {rows:,}" for node, rows in sorted(result.before_rows.items()))
+        after = ", ".join(f"{node} {rows:,}" for node, rows in sorted(result.after_rows.items()))
+        self._log(f"Sync rows before: {before}")
+        self._log(f"Sync rows after: {after}")
+        if result.drift_tables:
+            self._log(f"Sync remaining drift: {', '.join(result.drift_tables)}")
+        else:
+            self._log("Sync row counts converged.")
         self.after(100, self.refresh_now)
 
     def _apply_health_findings(self, findings: list[HealthFinding]) -> None:
